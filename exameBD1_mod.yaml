@@ -1,0 +1,438 @@
+heat_template_version: 2016-04-08
+description: Exercise 1 of the Big Data Exam - Leticia Decker - UNIBO
+
+# parameters to pass to stack
+parameters:
+    directory_name:
+        description: name of the shared directory using NFS
+        type: string
+        label: directory name
+        default: /shared_volume
+    
+    keyname:
+        type: string
+        label: keyname
+        description: the name of the key for the security access.
+        default: key3
+
+    image:
+        type: string
+        label: image
+        description: the operating system of the machine
+        default: centos-6.8-x86_64-cnaf
+
+    flavor:
+        type: string
+        label: flavor
+        description: the hw of the machine
+        default: d1.small
+        constraints:
+            - allowed_values: [m1.tiny,d1.small,m2.medium,m1.small]
+
+    floating-network-id:
+        type: string 
+        label: floating-network-id
+        description: the floating ip for an external access. 
+        default: "17d5949b-5694-4eab-abe0-c8039f0bd498"
+
+    availability_zone:
+        type: string
+        label: availability zone
+        description: The Availability Zone to launch the instance.
+        default: nova
+
+    volume_size:
+        type: number
+        label: volume_size
+        description: Size of the volume to be created.
+        default: 10
+        constraints:
+            - range: {min: 1, max: 1024 }
+
+    cidr_address:
+        type: string
+        label: cidr_address
+        description: cidr address of the subnet 
+        default: "10.0.0.0/24"
+
+    master_address:
+        type: string
+        label: master_address
+        description: the address of the master machine into the subnet 
+        default: "10.0.0.5"
+
+    slave1_address:
+        type: string
+        label: slave1_address
+        description: the address of the slave1 machine into the subnet
+        default: "10.0.0.6"
+
+    slave2_address:
+        type: string
+        label: slave2_address
+        description: the address of the slave2 machine into the subnet 
+        default: "10.0.0.7"
+
+
+#creation of the network topology
+resources: 
+    # the first private network connect to public network
+    net1:
+        type: OS::Neutron::Net 
+        properties:
+            name: net1
+    # subnet to connect to the external router 
+    subnet1:
+        type: OS::Neutron::Subnet
+        properties:
+            name: subnet1
+            network_id: {get_resource: net1}
+            cidr: {get_param: cidr_address}
+            gateway_ip: "10.0.0.1"
+  
+    # the router that connects to public network 
+    router1:
+        type: OS::Neutron::Router 
+        properties: 
+            name: router1
+            external_gateway_info:
+                network: {get_param: floating-network-id}
+  
+    router1InterfaceNet1:
+        type: OS::Neutron::RouterInterface
+        properties:
+            router_id: {get_resource: router1}
+            subnet_id: {get_resource: subnet1}
+
+    # security groups used
+    phd-ui-openstack-secgroup:
+        type: OS::Neutron::SecurityGroup
+        properties:
+            name: phd-ui-openstack-secgroup
+            rules:
+                - protocol: icmp
+                  direction: ingress
+                - protocol: tcp
+                  direction: ingress
+                  port_range_min: 22
+                  port_range_max: 22
+                - protocol: tcp
+                  direction: ingress
+                  port_range_min: 80
+                  port_range_max: 80
+            
+    intra-sec-group:
+        type: OS::Neutron::SecurityGroup
+        properties:
+            name: intra-sec-group
+            rules:
+                - protocol: icmp
+                  direction: ingress
+                  remote_ip_prefix: { get_param: cidr_address }
+                - protocol: tcp
+                  direction: ingress
+                  port_range_min: 1
+                  port_range_max: 65535
+                  remote_ip_prefix: { get_param: cidr_address }
+
+    # creation of the volume
+    cinder_volume:
+        type: OS::Cinder::Volume
+        properties:
+            read_only: false
+            size: { get_param: volume_size }
+            availability_zone: { get_param: availability_zone }
+    
+    volume_attachment:
+        type: OS::Cinder::VolumeAttachment
+        depends_on:
+            - cinder_volume
+        properties:
+            volume_id: {get_resource: cinder_volume}
+            instance_uuid: {get_resource: master}
+            mountpoint: /dev/sdb
+            
+    # associate a floating ip to the master node
+    floating-ip:
+        type: OS::Neutron::FloatingIP
+        properties:
+            floating_network_id: {get_param: floating-network-id}
+
+    floatingip-association:
+        type: OS::Neutron::FloatingIPAssociation
+        properties:
+            floatingip_id: {get_resource: floating-ip}
+            port_id: {get_resource: master-port}
+
+    # create the worker nodes slaves at net1, the most internal network
+    slave1-port:
+        type: OS::Neutron::Port
+        properties:
+            name: slave1-port
+            network: {get_resource: net1}
+            fixed_ips:
+              - subnet_id: { get_resource: subnet1 }
+                ip_address: { get_param: slave1_address }
+            security_groups:
+              - get_resource: intra-sec-group
+
+    slave1:
+        type: OS::Nova::Server
+        depends_on: 
+            - master
+            - subnet1
+        properties:
+            name: slave1
+            key_name: {get_param: keyname}
+            image: {get_param: image}
+            flavor: {get_param: flavor}
+            networks:
+              - port: {get_resource: slave1-port}
+            user_data: 
+                str_replace:
+                    template: | 
+                        #!/bin/bash 
+
+                        # **** SLAVE SETTINGS ****
+
+                        # UPDATING THE HOST LIST
+                        echo "$MASTERIP master" >> /etc/hosts
+                        echo "$SLAVE1IP slave1" >> /etc/hosts
+                        echo "$SLAVE2IP slave2" >> /etc/hosts
+                        # INSTALLING THE NFS LIBRARIES
+                        yum -y -q  install nfs-utils nfs-utils-lib 
+                        chkconfig rpcbind on
+                        service rpcbind start
+                        chkconfig nfslock on
+                        service nfslock start
+
+                        # MOUNTING THE MASTER DIRECTORY
+                        mkdir $DIRECTORYNAME
+                        echo "$MASTERIP:$DIRECTORYNAME $DIRECTORYNAME nfs rw,sync,hard,intr 0 0" >> /etc/fstab
+                        mount $MASTERIP:$DIRECTORYNAME $DIRECTORYNAME
+                        # SETTING THE PERMISSIONS
+                        chmod 777 $DIRECTORYNAME
+
+                        # PYTHON 2.7 AND LIBRARIES - FOR THE APPLICATION TEST
+                        yum install numpy.x86_64
+
+                        wget https://dl.fedoraproject.org/pub/epel/epel-release-latest-6.noarch.rpm
+                        rpm -Uhv epel-release-latest-6.noarch.rpm
+                        wget https://centos6.iuscommunity.org/ius-release.rpm
+                        rpm -Uhv ius-release.rpm
+                        yum -y install python27 python27-devel python27-pip python27-setuptools python27-virtualenv --enablerepo=ius
+                
+                        # CONDOR INSTALLATION
+                        wget http://research.cs.wisc.edu/htcondor/yum/repo.d/htcondor-stable-rhel6.repo
+                        cp htcondor-stable-rhel6.repo /etc/yum.repos.d/
+                        wget http://htcondor.org/yum/RPM-GPG-KEY-HTCondor
+                        rpm --import RPM-GPG-KEY-HTCondor
+                        yum -y -q install condor-all
+                        # CONDOR FILE SETTINGS
+                        CONFIGURATION_FILE=/etc/condor/condor_config 
+                        CONFIGURATION_FILE_LOCAL=/etc/condor/condor_config.local
+                        # CONDOR HOST SETTING
+                        echo "CONDOR_HOST = $MASTERIP" >> $CONFIGURATION_FILE 
+                        echo "CONDOR_HOST = $MASTERIP" >> $CONFIGURATION_FILE_LOCAL
+                        echo "HOSTALLOW_READ = *" >> $CONFIGURATION_FILE 
+                        echo "HOSTALLOW_WRITE = *" >> $CONFIGURATION_FILE 
+                        echo "#HOSTDENY_WRITE = *" >> $CONFIGURATION_FILE 
+                        echo "HOSTALLOW_ADMINISTRATOR = *" >> $CONFIGURATION_FILE 
+                        echo "#HOSTALLOW_OWNER = *" >> $CONFIGURATION_FILE
+                        # CONDOR DAEMON SETTINGS
+                        echo "DAEMON_LIST = MASTER, SCHEDD, STARTD" >> $CONFIGURATION_FILE 
+                        /etc/init.d/condor start
+                    params:
+                        $MASTERIP: {get_param: master_address}
+                        $SLAVE1IP: {get_param: slave1_address}
+                        $SLAVE2IP: {get_param: slave2_address}
+                        $DIRECTORYNAME: {get_param: directory_name}
+
+    slave2-port:
+        type: OS::Neutron::Port
+        properties:
+            name: slave2-port
+            network: {get_resource: net1}
+            fixed_ips:
+              - subnet_id: { get_resource: subnet1 }
+                ip_address: { get_param: slave2_address }
+            security_groups:
+              - get_resource: intra-sec-group
+
+    slave2:
+        type: OS::Nova::Server
+        depends_on: 
+            - master
+            - subnet1
+        properties:
+            name: slave2
+            key_name: {get_param: keyname}
+            image: {get_param: image}
+            flavor: {get_param: flavor}
+            networks:
+              - port: {get_resource: slave2-port}
+            user_data: 
+                str_replace:
+                    template: |
+                        #!/bin/bash 
+
+                        # **** SLAVE SETTINGS ****
+
+                        # UPDATING THE HOST LIST
+                        echo "$MASTERIP master" >> /etc/hosts
+                        echo "$SLAVE1IP slave1" >> /etc/hosts
+                        echo "$SLAVE2IP slave2" >> /etc/hosts
+                        # INSTALLING THE NFS LIBRARIES
+                        yum -y -q  install nfs-utils nfs-utils-lib 
+                        chkconfig rpcbind on
+                        service rpcbind start
+                        chkconfig nfslock on
+                        service nfslock start
+
+                        # MOUNTING THE MASTER DIRECTORY
+                        mkdir $DIRECTORYNAME
+                        echo "$MASTERIP:$DIRECTORYNAME $DIRECTORYNAME nfs rw,sync,hard,intr 0 0" >> /etc/fstab
+                        mount $MASTERIP:$DIRECTORYNAME $DIRECTORYNAME
+                        # SETTING THE PERMISSIONS
+                        chmod 777 $DIRECTORYNAME
+
+                        # PYTHON 2.7 AND LIBRARIES - FOR THE APPLICATION TEST
+                        yum install numpy.x86_64
+
+                        wget https://dl.fedoraproject.org/pub/epel/epel-release-latest-6.noarch.rpm
+                        rpm -Uhv epel-release-latest-6.noarch.rpm
+                        wget https://centos6.iuscommunity.org/ius-release.rpm
+                        rpm -Uhv ius-release.rpm
+                        yum -y install python27 python27-devel python27-pip python27-setuptools python27-virtualenv --enablerepo=ius
+                
+                        # CONDOR INSTALLATION
+                        wget http://research.cs.wisc.edu/htcondor/yum/repo.d/htcondor-stable-rhel6.repo
+                        cp htcondor-stable-rhel6.repo /etc/yum.repos.d/
+                        wget http://htcondor.org/yum/RPM-GPG-KEY-HTCondor
+                        rpm --import RPM-GPG-KEY-HTCondor
+                        yum -y -q install condor-all
+                        # CONDOR FILE SETTINGS
+                        CONFIGURATION_FILE=/etc/condor/condor_config 
+                        CONFIGURATION_FILE_LOCAL=/etc/condor/condor_config.local
+                        # CONDOR HOST SETTING
+                        echo "CONDOR_HOST = $MASTERIP" >> $CONFIGURATION_FILE 
+                        echo "CONDOR_HOST = $MASTERIP" >> $CONFIGURATION_FILE_LOCAL
+                        echo "HOSTALLOW_READ = *" >> $CONFIGURATION_FILE 
+                        echo "HOSTALLOW_WRITE = *" >> $CONFIGURATION_FILE 
+                        echo "#HOSTDENY_WRITE = *" >> $CONFIGURATION_FILE 
+                        echo "HOSTALLOW_ADMINISTRATOR = *" >> $CONFIGURATION_FILE 
+                        echo "#HOSTALLOW_OWNER = *" >> $CONFIGURATION_FILE
+                        # CONDOR DAEMON SETTINGS
+                        echo "DAEMON_LIST = MASTER, SCHEDD, STARTD" >> $CONFIGURATION_FILE 
+                        /etc/init.d/condor start
+                    params:
+                        $MASTERIP: {get_param: master_address}
+                        $SLAVE1IP: {get_param: slave1_address}
+                        $SLAVE2IP: {get_param: slave2_address}
+                        $DIRECTORYNAME: {get_param: directory_name}
+    
+    master-port:
+        type: OS::Neutron::Port
+        properties:
+            name: master-port
+            network: {get_resource: net1}
+            fixed_ips:
+              - subnet_id: { get_resource: subnet1 }
+                ip_address:  { get_param: master_address }
+            security_groups:
+              - get_resource: intra-sec-group 
+              - get_resource: phd-ui-openstack-secgroup
+
+    master:
+        type: OS::Nova::Server
+        depends_on: 
+            - cinder_volume
+            - subnet1
+        properties:
+            name: master
+            availability_zone: { get_param: availability_zone }
+            key_name: {get_param: keyname}
+            image: {get_param: image}
+            flavor: {get_param: flavor}
+            user_data_format: RAW
+            networks:
+              - port: {get_resource: master-port}
+            user_data:
+                str_replace:
+                    template: |
+                        #!/bin/bash 
+
+                        # **** MASTER SETTINGS ****
+
+                        # UPDATING THE HOST LIST
+                        echo "$MASTERIP master" >> /etc/hosts
+                        echo "$SLAVE1IP slave1" >> /etc/hosts
+                        echo "$SLAVE2IP slave2" >> /etc/hosts
+                        # INSTALLING THE NFS LIBRARIES
+                        yum -y -q install nfs-utils nfs-utils-lib 
+                        # FORMATING THE DIRECTORY /dev/vdb
+                        mkfs.ext4 /dev/vdb
+                        mkdir $DIRECTORYNAME
+                        # MOUNTING THE /dev/vdb 
+                        echo "/dev/vdb $DIRECTORYNAME ext4 user,rw,auto 0 0" >> /etc/fstab
+                        mount /dev/vdb
+                        chkconfig rpcbind on
+                        chkconfig nfs on
+                        echo "$DIRECTORYNAME $CIDRADDRESS(rw,sync,crossmnt,no_root_squash,no_subtree_check)" >> /etc/exports
+                        exportfs -a
+                        rpcbind
+                        # SETTING THE PERMISSIONS
+                        chmod 777 $DIRECTORYNAME
+                        # STARTING THE NFS SERVICE
+                        service nfs start
+                        
+                        # PYTHON 2.7 AND NUMPY - FOR THE APPLICATION TEST
+                        yum install numpy.x86_64
+
+                        wget https://dl.fedoraproject.org/pub/epel/epel-release-latest-6.noarch.rpm
+                        rpm -Uhv epel-release-latest-6.noarch.rpm
+                        wget https://centos6.iuscommunity.org/ius-release.rpm
+                        rpm -Uhv ius-release.rpm
+                        yum -y install python27 python27-devel python27-pip python27-setuptools python27-virtualenv --enablerepo=ius
+
+                        # CONDOR INSTALLATION
+                        wget http://research.cs.wisc.edu/htcondor/yum/repo.d/htcondor-stable-rhel6.repo
+                        cp htcondor-stable-rhel6.repo /etc/yum.repos.d/
+                        wget http://htcondor.org/yum/RPM-GPG-KEY-HTCondor
+                        rpm --import RPM-GPG-KEY-HTCondor
+                        yum -y -q install condor-all
+                        # CONDOR FILE SETTINGS
+                        CONFIGURATION_FILE=/etc/condor/condor_config 
+                        CONFIGURATION_FILE_LOCAL=/etc/condor/condor_config.local
+                        # CONDOR HOST SETTING
+                        echo "CONDOR_HOST = $MASTERIP" >> $CONFIGURATION_FILE 
+                        echo "CONDOR_HOST = $MASTERIP" >> $CONFIGURATION_FILE_LOCAL
+                        echo "HOSTALLOW_READ = *" >> $CONFIGURATION_FILE 
+                        echo "HOSTALLOW_WRITE = *" >> $CONFIGURATION_FILE 
+                        echo "#HOSTDENY_WRITE = *" >> $CONFIGURATION_FILE 
+                        echo "HOSTALLOW_ADMINISTRATOR = *" >> $CONFIGURATION_FILE 
+                        echo "#HOSTALLOW_OWNER = *" >> $CONFIGURATION_FILE
+                        /etc/init.d/condor start 
+                    params:
+                        $DIRECTORYNAME: {get_param: directory_name}
+                        $MASTERIP: {get_param: master_address}
+                        $SLAVE1IP: {get_param: slave1_address}
+                        $SLAVE2IP: {get_param: slave2_address}
+                        $CIDRADDRESS: {get_param: cidr_address}
+    
+    
+outputs:
+    master:
+        description: master name
+        value: {get_attr: [master, name]}
+    floating-ip:
+        description: floating ip address
+        value: {get_attr: [floating-ip, floating_ip_address]}
+
+    slave1:
+        description: slave1 name
+        value: {get_attr: [slave1, name]}
+
+    slave2:
+        description: slave2 name
+        value: {get_attr: [slave2, name]}
