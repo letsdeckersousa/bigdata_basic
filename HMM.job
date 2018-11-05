@@ -1,0 +1,38 @@
+####### file to  be executed #######
+
+Executable = hmm_call.sh
+
+############ Input Sandbox  #########################
+  
+#Can contain standard input
+
+transfer_input_files = graph.py, matrix.py, HMM.py, probabilityEmission.txt, probabilityTransmission.txt
+
+## Arguments that will be passed to the executable ##
+
+
+
+###### Output Sandbox ###############################
+
+Log        = hmm.log    
+# will contain condor log
+
+Output     = hmm.out    
+# will contain the standard output
+
+Error      = hmm.error  
+# will contain the standard error
+
+transfer_output_files = output.txt
+
+############## condor control variables #############
+
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+Universe   = vanilla
+
+
+#####################################################
+
+Queue
